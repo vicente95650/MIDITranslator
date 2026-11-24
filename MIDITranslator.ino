@@ -2,16 +2,18 @@
 
 USBHost myusb;
 USBHub hub1(myusb);
-MIDIDevice casioLower(myusb);
-MIDIDevice casioUpper(myusb);
+MIDIDevice casio(myusb);
 
 const int modeSwitchPin = 2;          // Pin 2 -> GND = Dodeka mode
 const int dublerPin = 3;              // Pin 3 -> GND = Dubler active
 const byte CASIO_LIGHT_CHANNEL = 3;   // Casio LK-160 key-light Navigate Channel
-const byte DUBLER_CC = 104;           // MIDI CC sent to Dubler
+const byte DUBLER_CC = 104;           // MIDI CC sent on Pin 3 state change
 
-int startingMidiNote = 48;            // C3 (change to 36 if you start at C2)
-int whiteKeyGaps[] = {2, 2, 1, 2, 2, 2, 1};
+const int PHYSICAL_START_NOTE = 36;   // Leftmost physical white key on 61-key Casio (C2)
+const int DODEKA_START_NOTE = 48;     // Output pitch for that leftmost key in Dodeka mode (C3)
+const int NUM_WHITE_KEYS = 36;        // All 36 white keys (C2-C7 -> 3 full octaves: C3-B5)
+
+const int whiteKeyGaps[] = {2, 2, 1, 2, 2, 2, 1};
 
 int dodekaMap[128];
 int reverseDodekaMap[128];
@@ -36,11 +38,11 @@ void setup() {
     reverseDodekaMap[i] = -1;
   }
 
-  int currentCasioNote = startingMidiNote;
-  int dodekaNote = startingMidiNote;
+  int currentCasioNote = PHYSICAL_START_NOTE;
+  int dodekaNote = DODEKA_START_NOTE;
 
-  // Map 72 consecutive white keys
-  for (int i = 0; i < 72; i++) {
+  // Map all 36 physical white keys (C2..C7) to 36 chromatic Dodeka notes (C3..B5)
+  for (int i = 0; i < NUM_WHITE_KEYS; i++) {
     if (currentCasioNote < 128 && dodekaNote < 128) {
       dodekaMap[currentCasioNote] = dodekaNote;
       reverseDodekaMap[dodekaNote] = currentCasioNote;
@@ -52,10 +54,8 @@ void setup() {
   myusb.begin();
 
   // Outgoing: Casio keys -> Mac (Synthesia / DAW)
-  casioLower.setHandleNoteOn(casioToPcNoteOn);
-  casioLower.setHandleNoteOff(casioToPcNoteOff);
-  casioUpper.setHandleNoteOn(casioToPcNoteOn);
-  casioUpper.setHandleNoteOff(casioToPcNoteOff);
+  casio.setHandleNoteOn(casioToPcNoteOn);
+  casio.setHandleNoteOff(casioToPcNoteOff);
 
   // Incoming: Mac (Synthesia / Dubler) -> Casio key lights
   usbMIDI.setHandleNoteOn(pcToCasioNoteOn);
@@ -86,7 +86,7 @@ void casioToPcNoteOn(byte channel, byte pitch, byte velocity) {
   }
 
   if (digitalRead(modeSwitchPin) == HIGH) {
-    usbMIDI.sendNoteOn(pitch, velocity, channel); // Mode 1: Piano
+    usbMIDI.sendNoteOn(pitch, velocity, channel); // Mode 1: Standard Piano
   } else {
     int translatedNote = dodekaMap[pitch];
     if (translatedNote != -1) {
@@ -116,13 +116,11 @@ void pcToCasioNoteOn(byte channel, byte pitch, byte velocity) {
   if (!dublerActive && !isRightHand(channel)) return;
 
   if (digitalRead(modeSwitchPin) == HIGH) {
-    casioLower.sendNoteOn(pitch, velocity, CASIO_LIGHT_CHANNEL);
-    casioUpper.sendNoteOn(pitch, velocity, CASIO_LIGHT_CHANNEL);
+    casio.sendNoteOn(pitch, velocity, CASIO_LIGHT_CHANNEL);
   } else {
     int casioPitch = reverseDodekaMap[pitch];
     if (casioPitch != -1) {
-      casioLower.sendNoteOn(casioPitch, velocity, CASIO_LIGHT_CHANNEL);
-      casioUpper.sendNoteOn(casioPitch, velocity, CASIO_LIGHT_CHANNEL);
+      casio.sendNoteOn(casioPitch, velocity, CASIO_LIGHT_CHANNEL);
     }
   }
 }
@@ -131,21 +129,18 @@ void pcToCasioNoteOff(byte channel, byte pitch, byte velocity) {
   if (!dublerActive && !isRightHand(channel)) return;
 
   if (digitalRead(modeSwitchPin) == HIGH) {
-    casioLower.sendNoteOff(pitch, 0, CASIO_LIGHT_CHANNEL);
-    casioUpper.sendNoteOff(pitch, 0, CASIO_LIGHT_CHANNEL);
+    casio.sendNoteOff(pitch, 0, CASIO_LIGHT_CHANNEL);
   } else {
     int casioPitch = reverseDodekaMap[pitch];
     if (casioPitch != -1) {
-      casioLower.sendNoteOff(casioPitch, 0, CASIO_LIGHT_CHANNEL);
-      casioUpper.sendNoteOff(casioPitch, 0, CASIO_LIGHT_CHANNEL);
+      casio.sendNoteOff(casioPitch, 0, CASIO_LIGHT_CHANNEL);
     }
   }
 }
 
 void loop() {
   myusb.Task();
-  casioLower.read();
-  casioUpper.read();
+  casio.read();
   usbMIDI.read();
   checkDublerPin();
 }
