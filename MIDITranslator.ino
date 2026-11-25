@@ -13,7 +13,7 @@ const int PHYSICAL_START_NOTE = 36;   // Leftmost physical white key on 61-key C
 const int DODEKA_START_NOTE = 48;     // Output pitch for that leftmost key in Dodeka mode (C3)
 const int NUM_WHITE_KEYS = 36;        // All 36 white keys (C2-C7 -> 3 full octaves: C3-B5)
 
-// Minimum dark gap (ms) before relighting the exact same key (try 40-100 ms to taste)
+// Minimum dark gap (ms) before relighting the exact same key
 const unsigned long RETRIGGER_GAP_MS = 60;
 
 const int whiteKeyGaps[] = {2, 2, 1, 2, 2, 2, 1};
@@ -21,14 +21,15 @@ const int whiteKeyGaps[] = {2, 2, 1, 2, 2, 2, 1};
 int dodekaMap[128];
 int reverseDodekaMap[128];
 
-// Per-key LED state for repeated-note blink
+// Per-key LED state for repeated-note blink & stuck-light prevention
 bool keyLit[128];
 unsigned long keyOffTime[128];
 bool pendingOn[128];
 unsigned long pendingOnTime[128];
 byte pendingVelocity[128];
 
-// Edge-detection & debounce state for Pin 3
+// Mode switch & Dubler pin state
+bool lastModeState = HIGH;
 bool lastDublerReading = HIGH;
 bool dublerActive = false;
 unsigned long lastDebounceTime = 0;
@@ -39,9 +40,23 @@ bool isRightHand(byte channel) {
   return (channel >= 7 && channel <= 11) || (channel == 13);
 }
 
+void clearAllLights() {
+  unsigned long now = millis();
+  for (int i = 0; i < 128; i++) {
+    if (keyLit[i] || pendingOn[i]) {
+      pendingOn[i] = false;
+      keyLit[i] = false;
+      keyOffTime[i] = now;
+      casio.sendNoteOff(i, 0, CASIO_LIGHT_CHANNEL);
+    }
+  }
+  casio.sendControlChange(123, 0, CASIO_LIGHT_CHANNEL);
+}
+
 void setup() {
   pinMode(modeSwitchPin, INPUT_PULLUP);
   pinMode(dublerPin, INPUT_PULLUP);
+  lastModeState = digitalRead(modeSwitchPin);
 
   for (int i = 0; i < 128; i++) {
     dodekaMap[i] = -1;
@@ -75,11 +90,17 @@ void setup() {
   // Incoming: Mac (Synthesia / Dubler) -> Casio key lights
   usbMIDI.setHandleNoteOn(pcToCasioNoteOn);
   usbMIDI.setHandleNoteOff(pcToCasioNoteOff);
+  usbMIDI.setHandleControlChange(pcToCasioControlChange);
 }
 
-void checkDublerPin() {
-  bool reading = digitalRead(dublerPin);
+void checkControlPins() {
+  bool modeNow = digitalRead(modeSwitchPin);
+  if (modeNow != lastModeState) {
+    lastModeState = modeNow;
+    clearAllLights();
+  }
 
+  bool reading = digitalRead(dublerPin);
   if (reading != lastDublerReading) {
     lastDebounceTime = millis();
     lastDublerReading = reading;
@@ -89,6 +110,7 @@ void checkDublerPin() {
     bool isGrounded = (reading == LOW);
     if (isGrounded != dublerActive) {
       dublerActive = isGrounded;
+      clearAllLights();
       usbMIDI.sendControlChange(DUBLER_CC, dublerActive ? 127 : 0, 1);
     }
   }
@@ -168,26 +190,29 @@ void pcToCasioNoteOn(byte channel, byte pitch, byte velocity) {
 }
 
 void pcToCasioNoteOff(byte channel, byte pitch, byte velocity) {
-  if (!dublerActive && !isRightHand(channel)) return;
-
   int casioPitch = (digitalRead(modeSwitchPin) == HIGH) ? pitch : reverseDodekaMap[pitch];
   if (casioPitch < 0 || casioPitch >= 128) return;
 
-  if (pendingOn[casioPitch]) {
-    pendingOn[casioPitch] = false;
-  }
+  // Always honor Note Off for any lit or pending Casio key, regardless of channel
+  if (!keyLit[casioPitch] && !pendingOn[casioPitch]) return;
 
+  pendingOn[casioPitch] = false;
+  keyLit[casioPitch] = false;
+  keyOffTime[casioPitch] = millis();
   casio.sendNoteOff(casioPitch, 0, CASIO_LIGHT_CHANNEL);
-  if (keyLit[casioPitch]) {
-    keyLit[casioPitch] = false;
-    keyOffTime[casioPitch] = millis();
+}
+
+void pcToCasioControlChange(byte channel, byte control, byte value) {
+  // Handle All Sound Off (120) and All Notes Off (123) on any channel
+  if (control == 120 || control == 123) {
+    clearAllLights();
   }
 }
 
 void loop() {
   myusb.Task();
-  casio.read();
-  usbMIDI.read();
-  checkDublerPin();
+  while (casio.read()) {}
+  while (usbMIDI.read()) {}
+  checkControlPins();
   processPendingLights();
 }
