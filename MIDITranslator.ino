@@ -7,42 +7,45 @@
  *    Sits between a 61-key Casio LK-160 keyboard (on Teensy's USB Host port)
  *    and a Mac running Synthesia and/or Dubler 2 (on Teensy's USB Device port).
  *    Translates notes bidirectionally between a standard 61-key layout and a
- *    36-key isomorphic Dodeka layout, filters incoming key-light MIDI channels,
- *    blinks repeated notes so they are visually distinct, and prevents stuck LEDs.
+ *    36-key isomorphic Dodeka layout, filters incoming key-light MIDI channels
+ *    via hardware switches, blinks repeated notes so they are visually distinct,
+ *    and prevents stuck LEDs.
  *
  *  HARDWARE & WIRING ASSUMPTIONS:
  *    - Board: Teensy 4.1 (Arduino IDE -> Tools -> USB Type -> MIDI).
  *    - USB Host Port (5-pin header): Connected to Casio LK-160 USB-B port.
  *    - USB Device Port (Micro-USB):  Connected to Mac.
- *    - Pin 2 (Mode Switch):  Wired to GND via switch/jumper (uses internal pull-up).
+ *    - Pin 2 (Mode Switch):  Wired to GND via switch/jumper (internal pull-up).
  *        * OPEN (HIGH)     = Standard 61-key Piano mode (1:1 pass-through).
  *        * GROUNDED (LOW)  = 36-key Dodeka mode (white keys only -> C3..B5).
  *    - Pin 3 (Dubler Gate):  Wired to GND via switch/pedal/jumper (internal pull-up).
  *        * OPEN (HIGH)     = Dubler 2 channel blocked; sends CC #104 = 0 on Ch 1.
  *        * GROUNDED (LOW)  = Dubler 2 channel allowed; sends CC #104 = 127 on Ch 1.
+ *    - Pin 4 (Hand Filter):  Wired to GND via switch/jumper (internal pull-up).
+ *        * OPEN (HIGH)     = Both Hands allowed (Synthesia LH + RH channels).
+ *                            Ideal for simple songs where melody spans both hands.
+ *        * GROUNDED (LOW)  = Right Hand Only (blocks Synthesia LH channels).
+ *                            Ideal for complex songs or when Exquis plays LH.
  *
  *  CASIO LK-160 ASSUMPTIONS:
  *    - 61 keys spanning physical MIDI 36 (C2) to MIDI 96 (C7) = 36 white keys.
  *    - Key-lighting hardware listens on Navigate Channel 3 (CASIO_LIGHT_CHANNEL).
- *    - Power on while holding [TONE] + [Power] to disable Auto Power Off so
- *      Local Control stays off during long practice sessions.
+ *    - Power on while holding [TONE] + [Power] to disable Auto Power Off.
  *
  *  SYNTHESIA ASSUMPTIONS (Settings -> Music Devices -> Teensy MIDI Output):
  *    - "Key Lights" is set to "Finger-based channel".
  *    - "My Notes", "Background Instruments", "Percussion", and "Metronome" are
  *      all turned OFF for Teensy MIDI (audio plays through the Mac's synth).
  *    - In "Finger-based channel" mode, Synthesia outputs 1-indexed MIDI channels:
- *        * Ch 1      : Unassigned / unknown hand
- *        * Ch 2 - 6  : Left Hand (fingers 1-5)   -> BLOCKED on Casio
- *        * Ch 7 - 11 : Right Hand (fingers 1-5)  -> ALLOWED on Casio
- *        * Ch 12     : Left Hand (unknown finger)-> BLOCKED on Casio
- *        * Ch 13     : Right Hand (unknown finger)-> ALLOWED on Casio
+ *        * Ch 1      : Unassigned / unknown hand (also Dubler 2's pitch channel)
+ *        * Ch 2 - 6  : Left Hand (fingers 1-5)   -> Controlled by Pin 4
+ *        * Ch 7 - 11 : Right Hand (fingers 1-5)  -> Always ALLOWED
+ *        * Ch 12     : Left Hand (unknown finger)-> Controlled by Pin 4
+ *        * Ch 13     : Right Hand (unknown finger)-> Always ALLOWED
  *
  *  DUBLER 2 ASSUMPTIONS:
  *    - Dubler 2 sends whistle/voice pitch MIDI notes on Channel 1 (DUBLER_CHANNEL).
- *    - Because Pin 3 specifically opens ONLY DUBLER_CHANNEL (Ch 1), Synthesia's
- *      Left Hand channels (Ch 2-6 and Ch 12) remain blocked even when Pin 3 is grounded.
- *    - Note: If you ever change Dubler's output channel, update DUBLER_CHANNEL below.
+ *    - Pin 3 independently gates DUBLER_CHANNEL without affecting Pin 4's LH/RH filter.
  * ============================================================================
  */
 
@@ -60,6 +63,7 @@ MIDIDevice casio(myusb);  // Represents the Casio LK-160 on the USB Host port
 // ----------------------------------------------------------------------------
 const int modeSwitchPin = 2;          // Pin 2 -> GND selects Dodeka mode
 const int dublerPin = 3;              // Pin 3 -> GND enables Dubler 2 lighting
+const int handFilterPin = 4;          // Pin 4 -> OPEN = Both Hands, GND = Right Hand Only
 
 const byte CASIO_LIGHT_CHANNEL = 3;   // Casio LK-160 key-light Navigate Channel (1-16)
 const byte DUBLER_CHANNEL = 1;        // Expected MIDI channel from Dubler 2 (1-16)
@@ -100,6 +104,7 @@ byte pendingVelocity[128];            // Saved velocity for the delayed relight
 // 5. SWITCH STATE & DEBOUNCING
 // ----------------------------------------------------------------------------
 bool lastModeState = HIGH;            // Last read state of Pin 2 (Piano vs Dodeka)
+bool lastHandFilterState = HIGH;      // Last read state of Pin 4 (Both Hands vs RH Only)
 bool lastDublerReading = HIGH;        // Raw last read state of Pin 3 (for debouncing)
 bool dublerActive = false;            // Debounced state: true when Pin 3 is grounded
 unsigned long lastDebounceTime = 0;   // Last time Pin 3 changed raw state
@@ -109,8 +114,14 @@ const unsigned long DEBOUNCE_MS = 30; // Debounce window (ms) to ignore switch c
 // HELPER FUNCTIONS
 // ============================================================================
 
-// Returns true if the incoming 1-indexed MIDI channel is one of Synthesia's
-// Right-Hand key-lighting channels (Ch 7-11 for fingered notes, Ch 13 for unfingered).
+// Returns true for Synthesia's Left-Hand key-lighting channels (1-indexed):
+// Ch 2-6 (fingered LH notes) and Ch 12 (unfingered LH notes).
+bool isLeftHand(byte channel) {
+  return (channel >= 2 && channel <= 6) || (channel == 12);
+}
+
+// Returns true for Synthesia's Right-Hand key-lighting channels (1-indexed):
+// Ch 7-11 (fingered RH notes) and Ch 13 (unfingered RH notes).
 bool isRightHand(byte channel) {
   return (channel >= 7 && channel <= 11) || (channel == 13);
 }
@@ -131,13 +142,20 @@ void clearAllLights() {
   casio.sendControlChange(123, 0, CASIO_LIGHT_CHANNEL);
 }
 
-// Polls Pin 2 (Piano/Dodeka mode) and Pin 3 (Dubler gate).
+// Polls Pin 2 (Piano/Dodeka), Pin 3 (Dubler gate), and Pin 4 (Both Hands/RH Only).
 // Clears all lights on any state change so no LEDs get stranded across mode switches.
 void checkControlPins() {
   // --- Pin 2: Piano vs. Dodeka Mode ---
   bool modeNow = digitalRead(modeSwitchPin);
   if (modeNow != lastModeState) {
     lastModeState = modeNow;
+    clearAllLights();
+  }
+
+  // --- Pin 4: Both Hands vs. Right Hand Only ---
+  bool handFilterNow = digitalRead(handFilterPin);
+  if (handFilterNow != lastHandFilterState) {
+    lastHandFilterState = handFilterNow;
     clearAllLights();
   }
 
@@ -220,9 +238,12 @@ void pcToCasioNoteOn(byte channel, byte pitch, byte velocity) {
 
   // Channel Gatekeeper:
   //   - Always allow Synthesia's Right-Hand channels (Ch 7-11, Ch 13).
-  //   - Allow Dubler's channel (Ch 1) ONLY when Pin 3 is grounded (dublerActive).
-  //   - Block Synthesia's Left-Hand channels (Ch 2-6, Ch 12) at all times.
-  bool allowChannel = isRightHand(channel) || (dublerActive && channel == DUBLER_CHANNEL);
+  //   - Allow Synthesia's Left-Hand channels (Ch 2-6, Ch 12) when Pin 4 is OPEN (HIGH).
+  //   - Allow Dubler's channel (Ch 1) when Pin 3 is GROUNDED (dublerActive).
+  bool allowLeftHand = (digitalRead(handFilterPin) == HIGH);
+  bool allowChannel = isRightHand(channel)
+                   || (allowLeftHand && isLeftHand(channel))
+                   || (dublerActive && channel == DUBLER_CHANNEL);
   if (!allowChannel) return;
 
   // Map incoming musical pitch to the target physical key on the Casio
@@ -261,8 +282,7 @@ void pcToCasioNoteOff(byte channel, byte pitch, byte velocity) {
   // Channel-agnostic Note Off:
   // If this physical key is currently lit (or queued to blink), turn it off
   // regardless of which MIDI channel carried the Note Off. This prevents stuck
-  // LEDs if Synthesia sends Note Off on a different channel than Note On, while
-  // still ignoring Note Offs for unlit Left-Hand keys.
+  // LEDs if Synthesia sends Note Off on a different channel than Note On.
   if (!keyLit[casioPitch] && !pendingOn[casioPitch]) return;
 
   pendingOn[casioPitch] = false;
@@ -287,7 +307,10 @@ void setup() {
   // Enable internal pull-up resistors (pins read HIGH when open, LOW when grounded)
   pinMode(modeSwitchPin, INPUT_PULLUP);
   pinMode(dublerPin, INPUT_PULLUP);
+  pinMode(handFilterPin, INPUT_PULLUP);
+
   lastModeState = digitalRead(modeSwitchPin);
+  lastHandFilterState = digitalRead(handFilterPin);
 
   // Initialize lookup tables and LED tracking arrays to a clean default state
   for (int i = 0; i < 128; i++) {
@@ -332,6 +355,6 @@ void loop() {
   myusb.Task();                    // Service Teensy USB Host hardware
   while (casio.read()) {}          // Drain all queued MIDI messages from Casio
   while (usbMIDI.read()) {}        // Drain all queued MIDI messages from Mac
-  checkControlPins();              // Poll Pin 2 (Mode) and Pin 3 (Dubler Gate)
+  checkControlPins();              // Poll Pins 2, 3, and 4
   processPendingLights();          // Fire any completed 60 ms repeated-note blinks
 }
