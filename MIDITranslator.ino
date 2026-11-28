@@ -1,14 +1,19 @@
 /*
  * ============================================================================
  *  Casio LK-160 <-> Teensy 4.1 MIDI Bridge & Live OLED MIDI Analyzer
- *  (Dodeka + Synthesia + Dubler 2 + Melody Assist + Octave Shift + Range Alert)
+ *  (Dodeka + Synthesia + Dubler 2 + Melody Assist + Smart Octave Folding)
  * ============================================================================
  *
  *  SERIAL COMMANDS (Tools -> USB Type -> Serial + MIDI):
  *    Open Arduino Serial Monitor and send a single character:
- *      - '?' or 'v' : Print firmware version, build timestamp, active Dodeka
- *                     range, switch states, OLED status, and any latched
- *                     out-of-range note alert.
+ *      - '?' or 'v' : Print firmware version, build timestamp, active range,
+ *                     switch states, Smart Fold status, OLED status, and any
+ *                     latched out-of-range note alert.
+ *      - 'F'        : Toggle Smart Octave Folding ON / OFF (default: ON).
+ *                     When ON, any playable note outside your keyboard range
+ *                     folds by 12 semitones to light an in-range key, and
+ *                     pressing that key sends the original out-of-range pitch
+ *                     back to Synthesia so playback never stalls.
  *      - 'O'        : Toggle Dodeka window between C3-B5 (default) and C4-B6.
  *      - '+' / '-'  : Shift Dodeka window up or down by 1 octave (C2..C5 base).
  *      - 'C'        : Clear the latched Range-Exceeded indicator (!HI / !LO).
@@ -18,7 +23,7 @@
  *  OPTIONAL 1.3" SH1106 I2C OLED DISPLAY:
  *    - Set ENABLE_OLED to 0 to compile without any display libraries.
  *    - Set ENABLE_OLED to 1 after installing "Adafruit SH110X" (+ "Adafruit GFX").
- *    - Wiring (check silkscreen labels on your OLED PCB):
+ *    - Wiring (verify silkscreen labels printed on your OLED PCB):
  *        * VCC -> Teensy 3.3V   (do NOT use 5V)
  *        * GND -> Teensy GND
  *        * SDA -> Teensy Pin 18
@@ -40,7 +45,7 @@
 // 0. FIRMWARE VERSION, OLED ENABLE, & ANALYZER LAYOUT OPTIONS
 // ----------------------------------------------------------------------------
 #define FW_NAME     "Casio LK-160 Bridge"
-#define FW_VERSION  "v2.3"
+#define FW_VERSION  "v2.4"
 
 // Change to 1 after installing "Adafruit SH110X" and "Adafruit GFX Library"
 #define ENABLE_OLED 0
@@ -84,7 +89,7 @@ const byte DUBLER_CC           = 104; // MIDI CC sent to Mac when Pin 3 toggles
 const byte SILENT_VELOCITY     = 1;   // Lowest valid Note On (inaudible in Synthesia)
 
 // ----------------------------------------------------------------------------
-// 3. KEYBOARD RANGE, DODEKA MAPPING, & BLINK TIMING
+// 3. KEYBOARD RANGE, DODEKA MAPPING, & SMART OCTAVE FOLDING
 // ----------------------------------------------------------------------------
 const int PHYSICAL_START_NOTE = 36;   // Leftmost key on 61-key Casio LK-160 (C2)
 const int PHYSICAL_END_NOTE   = 96;   // Rightmost key on 61-key Casio LK-160 (C7)
@@ -95,7 +100,8 @@ const int ALT_DODEKA_START     = 60;  // C4 (window: C4..B6)
 const int MIN_DODEKA_START     = 36;  // C2 (lowest allowed shift via '-')
 const int MAX_DODEKA_START     = 72;  // C5 (highest allowed shift via '+')
 
-int currentDodekaStart = DEFAULT_DODEKA_START;
+int  currentDodekaStart = DEFAULT_DODEKA_START;
+bool smartFoldEnabled   = true;       // Toggle live via Serial 'F'
 
 const unsigned long RETRIGGER_GAP_MS = 60; // Dark blink gap (ms) for repeated notes
 const int whiteKeyGaps[] = {2, 2, 1, 2, 2, 2, 1};
@@ -110,27 +116,29 @@ const char* NOTE_NAMES[12] = {
 // ----------------------------------------------------------------------------
 // 4. LATCHED RANGE-EXCEEDED TRACKER (Cleared via Serial 'C' or Octave Change)
 // ----------------------------------------------------------------------------
-bool oorLow       = false;            // True if a playable note fell below range
-bool oorHigh      = false;            // True if a playable note exceeded range
-int  oorMinPitch  = 128;              // Lowest out-of-range pitch captured
-int  oorMaxPitch  = -1;               // Highest out-of-range pitch captured
+bool oorLow       = false;
+bool oorHigh      = false;
+int  oorMinPitch  = 128;
+int  oorMaxPitch  = -1;
 
 // ----------------------------------------------------------------------------
-// 5. PER-KEY CASIO LED STATE (indexed by physical Casio MIDI note 0..127)
+// 5. PER-KEY CASIO LED & NOTE-OFF STATE (indexed by physical Casio key 0..127)
 // ----------------------------------------------------------------------------
 bool keyLit[128];
 unsigned long keyOffTime[128];
 bool pendingOn[128];
 unsigned long pendingOnTime[128];
 byte pendingVelocity[128];
+int  sentPitchForCasioKey[128];       // Exact musical pitch sent on NoteOn (for clean NoteOff)
 
 // ----------------------------------------------------------------------------
-// 6. MELODY ASSIST TRACKER (indexed by musical MIDI pitch 0..127)
+// 6. MELODY ASSIST & FOLD TRACKER (indexed by musical MIDI pitch 0..127)
 // ----------------------------------------------------------------------------
-bool synthesiaActive[128];
-byte synthesiaVelocity[128];
-bool autoSatisfied[128];
-bool autoNoteOnSent[128];
+bool synthesiaActive[128];            // True while Synthesia holds this note active
+byte synthesiaVelocity[128];          // Velocity Synthesia sent for this note
+bool autoSatisfied[128];              // True once we've auto-pressed this lower note
+bool autoNoteOnSent[128];             // True if we sent an auto NoteOn needing NoteOff
+int  litCasioKeyForPitch[128];        // Physical Casio key lit for this pitch (-1 if none)
 
 // ----------------------------------------------------------------------------
 // 7. SWITCH STATE & DEBOUNCING
@@ -162,13 +170,11 @@ byte currentOledLayout = DEFAULT_OLED_LAYOUT;
   const unsigned long SPLASH_DURATION_MS  = 2000;
   const unsigned long OLED_MIN_REFRESH_MS = 80;
 
-  // Layout A: Fixed Slot text buffers
   char slotIn[24]  = "IN  ---";
   char slotFlt[24] = "FLT ---";
   char slotOut[24] = "OUT ---";
   char slotAut[24] = "AUT ---";
 
-  // Layout B: 4-Line chronological scrolling log
   char logLines[4][24] = { "", "", "", "" };
 #endif
 
@@ -178,7 +184,7 @@ byte currentOledLayout = DEFAULT_OLED_LAYOUT;
 void clearAllLightsAndState();
 
 // ============================================================================
-// HELPER FUNCTIONS: MODE, RANGE, & NOTE FORMATTING
+// HELPER FUNCTIONS: MODE, RANGE, FOLDING, & NOTE FORMATTING
 // ============================================================================
 
 bool isPianoMode()        { return digitalRead(modeSwitchPin)   == HIGH; }
@@ -200,7 +206,6 @@ const char* getAssistShortLabel() {
   return isHarmonySoundOn() ? "SND" : "SIL";
 }
 
-// Formats a MIDI pitch (0..127) as "C3", "G#4", etc.
 void formatNoteName(byte pitch, char* out, size_t outSize) {
   int octave = (pitch / 12) - 1;
   snprintf(out, outSize, "%s%d", NOTE_NAMES[pitch % 12], octave);
@@ -214,7 +219,7 @@ int getMaxPlayablePitch() {
   return isPianoMode() ? PHYSICAL_END_NOTE : (currentDodekaStart + NUM_WHITE_KEYS - 1);
 }
 
-// Maps musical pitch to physical Casio key (-1 if outside physical range)
+// Native (unfolded) musical pitch -> physical Casio key (-1 if out of range)
 int musicalToCasioPitch(int musicalPitch) {
   if (musicalPitch < 0 || musicalPitch >= 128) return -1;
   if (isPianoMode()) {
@@ -224,6 +229,16 @@ int musicalToCasioPitch(int musicalPitch) {
   return reverseDodekaMap[musicalPitch];
 }
 
+// Folds an out-of-range pitch by multiples of 12 semitones into [minPitch..maxPitch]
+int foldPitchToRange(int pitch) {
+  int minP = getMinPlayablePitch();
+  int maxP = getMaxPlayablePitch();
+  if (minP >= maxP) return pitch;
+  while (pitch < minP) pitch += 12;
+  while (pitch > maxP) pitch -= 12;
+  return pitch;
+}
+
 int getHighestActiveSynthesiaNote() {
   for (int p = 127; p >= 0; p--) {
     if (synthesiaActive[p]) return p;
@@ -231,7 +246,15 @@ int getHighestActiveSynthesiaNote() {
   return -1;
 }
 
-// Rebuilds the bidirectional 36-key Dodeka lookup tables for currentDodekaStart
+// Returns true if any currently active Synthesia note is still using this physical key
+bool isCasioKeyStillNeeded(int casioKey) {
+  if (casioKey < 0 || casioKey >= 128) return false;
+  for (int p = 0; p < 128; p++) {
+    if (litCasioKeyForPitch[p] == casioKey) return true;
+  }
+  return false;
+}
+
 void rebuildDodekaMap() {
   for (int i = 0; i < 128; i++) {
     dodekaMap[i]        = -1;
@@ -261,7 +284,6 @@ void clearRangeAlert() {
 #endif
 }
 
-// Latches low/high range-exceeded flags when a playable note falls outside range
 void latchOutOfRange(byte pitch) {
   if (pitch < getMinPlayablePitch()) {
     oorLow = true;
@@ -330,8 +352,7 @@ void drawOledScreen() {
   display.setTextSize(1);
   display.setTextWrap(false);
 
-  // --- Top Compact Status Bar ---
-  // Left/Center: Mode + Base Note + Hands + Assist + Dubler (e.g. "DDK C3 BH SIL D0")
+  // Top Compact Status Bar (e.g. "DDK C3 BH SIL F1")
   char startStr[6];
   if (isPianoMode()) {
     snprintf(startStr, sizeof(startStr), "61");
@@ -340,12 +361,12 @@ void drawOledScreen() {
   }
 
   char header[20];
-  snprintf(header, sizeof(header), "%s %s %s %s D%d",
+  snprintf(header, sizeof(header), "%s %s %s %s F%d",
            isPianoMode() ? "PIA" : "DDK",
            startStr,
            isBothHandsAllowed() ? "BH" : "RH",
            getAssistShortLabel(),
-           dublerActive ? 1 : 0);
+           smartFoldEnabled ? 1 : 0);
 
   display.setCursor(0, 1);
   display.print(header);
@@ -365,7 +386,6 @@ void drawOledScreen() {
 
   display.drawFastHLine(0, 11, 128, SH110X_WHITE);
 
-  // --- Analyzer Body (4 lines) ---
   if (currentOledLayout == OLED_LAYOUT_SLOTS) {
     display.setCursor(0, 15); display.print(slotIn);
     display.setCursor(0, 28); display.print(slotFlt);
@@ -447,7 +467,7 @@ void serviceOled() {
 }
 
 // ============================================================================
-// HELPER FUNCTIONS: SERIAL COMMANDS ('?', 'O', '+', '-', 'C', 'L')
+// HELPER FUNCTIONS: SERIAL COMMANDS ('?', 'F', 'O', '+', '-', 'C', 'L')
 // ============================================================================
 
 void printActiveRange() {
@@ -503,11 +523,12 @@ void printFirmwareInfo() {
 
   Serial.print("Range    : ");
   printActiveRange();
-  Serial.println();
+  Serial.print(" | SmartFold: ");
+  Serial.println(smartFoldEnabled ? "ON" : "OFF");
 
   Serial.print("OOR Alert: ");
   if (!oorLow && !oorHigh) {
-    Serial.println("OK (no notes exceeded range)");
+    Serial.println("OK (no notes exceeded native range)");
   } else {
     char noteStr[8];
     if (oorLow) {
@@ -529,7 +550,7 @@ void printFirmwareInfo() {
     Serial.println("-- send 'C' to clear");
   }
 
-  Serial.println("Commands : '?'=Status | 'O'=C3/C4 | '+'/'-'=Octave | 'C'=Clear OOR | 'L'=Layout");
+  Serial.println("Commands : '?'=Status | 'F'=SmartFold | 'O'=C3/C4 | '+'/'-'=Octave | 'C'=Clear OOR | 'L'=Layout");
   Serial.println("========================================");
 }
 
@@ -552,6 +573,15 @@ void checkSerialQuery() {
     char c = Serial.read();
     if (c == '?' || c == 'v' || c == 'V') {
       printFirmwareInfo();
+    } else if (c == 'f' || c == 'F') {
+      smartFoldEnabled = !smartFoldEnabled;
+      clearAllLightsAndState();
+      Serial.print("Smart Octave Folding: ");
+      Serial.println(smartFoldEnabled ? "ON" : "OFF");
+#if ENABLE_OLED
+      splashActive = false;
+      oledDirty = true;
+#endif
     } else if (c == 'o' || c == 'O') {
       int nextStart = (currentDodekaStart == DEFAULT_DODEKA_START)
                         ? ALT_DODEKA_START
@@ -616,6 +646,39 @@ void extinguishPhysicalKey(int casioPitch) {
   casio.sendNoteOff(casioPitch, 0, CASIO_LIGHT_CHANNEL);
 }
 
+// Lights a musical pitch on the Casio, applying Smart Octave Folding if needed.
+// Returns the physical Casio key that was lit (-1 if out of range & folding is OFF).
+int lightMusicalPitch(byte channel, byte pitch, byte velocity, bool trackForSynthesia) {
+  int casioKey = musicalToCasioPitch(pitch);
+  if (casioKey != -1) {
+    // Native in-range note
+    lightPhysicalKey(casioKey, velocity);
+    if (trackForSynthesia) litCasioKeyForPitch[pitch] = casioKey;
+    char velBuf[8];
+    snprintf(velBuf, sizeof(velBuf), "v%d", velocity);
+    recordMidiEvent("IN", channel, pitch, velBuf);
+    return casioKey;
+  }
+
+  // Out of native range: latch alert
+  latchOutOfRange(pitch);
+
+  if (smartFoldEnabled) {
+    int foldedPitch = foldPitchToRange(pitch);
+    casioKey = musicalToCasioPitch(foldedPitch);
+    if (casioKey != -1) {
+      lightPhysicalKey(casioKey, velocity);
+      if (trackForSynthesia) litCasioKeyForPitch[pitch] = casioKey;
+      recordMidiEvent("IN", channel, pitch, "FLD");
+      return casioKey;
+    }
+  }
+
+  if (trackForSynthesia) litCasioKeyForPitch[pitch] = -1;
+  recordMidiEvent("FLT", channel, pitch, "OOR");
+  return -1;
+}
+
 void clearAllLightsAndState() {
   unsigned long now = millis();
   for (int i = 0; i < 128; i++) {
@@ -625,13 +688,18 @@ void clearAllLightsAndState() {
       keyOffTime[i] = now;
       casio.sendNoteOff(i, 0, CASIO_LIGHT_CHANNEL);
     }
+    if (sentPitchForCasioKey[i] != -1) {
+      usbMIDI.sendNoteOff(sentPitchForCasioKey[i], 0, 1);
+      sentPitchForCasioKey[i] = -1;
+    }
     if (autoNoteOnSent[i]) {
       usbMIDI.sendNoteOff(i, 0, 1);
       autoNoteOnSent[i] = false;
     }
-    synthesiaActive[i] = false;
-    synthesiaVelocity[i] = 0;
-    autoSatisfied[i] = false;
+    synthesiaActive[i]     = false;
+    synthesiaVelocity[i]   = 0;
+    autoSatisfied[i]       = false;
+    litCasioKeyForPitch[i] = -1;
   }
   casio.sendControlChange(123, 0, CASIO_LIGHT_CHANNEL);
 }
@@ -646,7 +714,7 @@ void checkControlPins() {
   if (modeNow != lastModeState || handNow != lastHandFilterState ||
       assistNow != lastMelodyAssistState || soundNow != lastHarmonySoundState) {
     if (modeNow != lastModeState) {
-      clearRangeAlert(); // Switching Piano <-> Dodeka changes playable range
+      clearRangeAlert();
     }
     lastModeState         = modeNow;
     lastHandFilterState   = handNow;
@@ -700,15 +768,55 @@ void casioToPcNoteOn(byte channel, byte pitch, byte velocity) {
     return;
   }
 
-  int musicalPitch = isPianoMode() ? pitch : dodekaMap[pitch];
-  if (musicalPitch == -1) return;
+  int basePitch = isPianoMode() ? pitch : dodekaMap[pitch];
+  if (basePitch == -1) return; // Ignore black keys in Dodeka mode
 
+  int  musicalPitch = basePitch;
+  bool wasFolded    = false;
+
+  // SMART OCTAVE UN-FOLDING:
+  // If Synthesia is waiting on an out-of-range note that folded onto this key,
+  // translate our outgoing pitch back to Synthesia's exact target pitch.
+  if (smartFoldEnabled) {
+    if (isMelodyAssistOn()) {
+      int highest = getHighestActiveSynthesiaNote();
+      if (highest != -1 && musicalToCasioPitch(highest) == -1 &&
+          foldPitchToRange(highest) == basePitch) {
+        musicalPitch = highest;
+        wasFolded    = true;
+      }
+    }
+
+    if (!wasFolded && !synthesiaActive[basePitch]) {
+      for (int p = 127; p >= 0; p--) {
+        if (synthesiaActive[p] && musicalToCasioPitch(p) == -1 &&
+            foldPitchToRange(p) == basePitch) {
+          musicalPitch = p;
+          wasFolded    = true;
+          break;
+        }
+      }
+    }
+  }
+
+  // Release any previous NoteOn still associated with this physical key
+  if (sentPitchForCasioKey[pitch] != -1) {
+    usbMIDI.sendNoteOff(sentPitchForCasioKey[pitch], 0, channel);
+  }
+  sentPitchForCasioKey[pitch] = musicalPitch;
+
+  // 1. Forward user's note FIRST (zero added latency)
   usbMIDI.sendNoteOn(musicalPitch, velocity, channel);
 
-  char velBuf[8];
-  snprintf(velBuf, sizeof(velBuf), "v%d", velocity);
-  recordMidiEvent("OUT", channel, (byte)musicalPitch, velBuf);
+  if (wasFolded) {
+    recordMidiEvent("OUT", channel, (byte)musicalPitch, "FLD");
+  } else {
+    char velBuf[8];
+    snprintf(velBuf, sizeof(velBuf), "v%d", velocity);
+    recordMidiEvent("OUT", channel, (byte)musicalPitch, velBuf);
+  }
 
+  // 2. MELODY ASSIST: Auto-press all lower active Synthesia notes
   if (isMelodyAssistOn()) {
     int highest = getHighestActiveSynthesiaNote();
     if (highest != -1 && musicalPitch == highest) {
@@ -729,10 +837,17 @@ void casioToPcNoteOn(byte channel, byte pitch, byte velocity) {
 }
 
 void casioToPcNoteOff(byte channel, byte pitch, byte velocity) {
-  int musicalPitch = isPianoMode() ? pitch : dodekaMap[pitch];
-  if (musicalPitch == -1) return;
+  // Always send NoteOff for the exact pitch we sent on NoteOn (even if unfolded)
+  if (sentPitchForCasioKey[pitch] != -1) {
+    usbMIDI.sendNoteOff(sentPitchForCasioKey[pitch], 0, channel);
+    sentPitchForCasioKey[pitch] = -1;
+    return;
+  }
 
-  usbMIDI.sendNoteOff(musicalPitch, 0, channel);
+  int musicalPitch = isPianoMode() ? pitch : dodekaMap[pitch];
+  if (musicalPitch != -1) {
+    usbMIDI.sendNoteOff(musicalPitch, 0, channel);
+  }
 }
 
 // ============================================================================
@@ -745,19 +860,9 @@ void pcToCasioNoteOn(byte channel, byte pitch, byte velocity) {
     return;
   }
 
-  char velBuf[8];
-  snprintf(velBuf, sizeof(velBuf), "v%d", velocity);
-
   // Case 1: Dubler 2 (Channel 1) bypasses Melody Assist chord tracking
   if (dublerActive && channel == DUBLER_CHANNEL) {
-    int casioKey = musicalToCasioPitch(pitch);
-    if (casioKey != -1) {
-      lightPhysicalKey(casioKey, velocity);
-      recordMidiEvent("IN", channel, pitch, velBuf);
-    } else {
-      latchOutOfRange(pitch);
-      recordMidiEvent("FLT", channel, pitch, "OOR");
-    }
+    lightMusicalPitch(channel, pitch, velocity, false);
     return;
   }
 
@@ -775,32 +880,24 @@ void pcToCasioNoteOn(byte channel, byte pitch, byte velocity) {
   if (isSilentAssist()) {
     int highest = getHighestActiveSynthesiaNote();
     if (pitch == highest) {
+      // Extinguish any lower keys that were previously lit
       for (int p = 0; p < highest; p++) {
-        if (synthesiaActive[p]) {
-          extinguishPhysicalKey(musicalToCasioPitch(p));
+        if (litCasioKeyForPitch[p] != -1) {
+          int oldKey = litCasioKeyForPitch[p];
+          litCasioKeyForPitch[p] = -1;
+          if (!isCasioKeyStillNeeded(oldKey)) {
+            extinguishPhysicalKey(oldKey);
+          }
         }
       }
-      int casioKey = musicalToCasioPitch(pitch);
-      if (casioKey != -1) {
-        lightPhysicalKey(casioKey, velocity);
-        recordMidiEvent("IN", channel, pitch, velBuf);
-      } else {
-        latchOutOfRange(pitch);
-        recordMidiEvent("FLT", channel, pitch, "OOR");
-      }
+      lightMusicalPitch(channel, pitch, velocity, true);
     } else {
-      // Lower note kept dark in Silent Assist (auto-pressed silently; never triggers OOR)
+      // Lower note kept dark in Silent Assist (auto-pressed silently)
+      litCasioKeyForPitch[pitch] = -1;
       recordMidiEvent("IN", channel, pitch, "HID");
     }
   } else {
-    int casioKey = musicalToCasioPitch(pitch);
-    if (casioKey != -1) {
-      lightPhysicalKey(casioKey, velocity);
-      recordMidiEvent("IN", channel, pitch, velBuf);
-    } else {
-      latchOutOfRange(pitch);
-      recordMidiEvent("FLT", channel, pitch, "OOR");
-    }
+    lightMusicalPitch(channel, pitch, velocity, true);
   }
 }
 
@@ -814,22 +911,33 @@ void pcToCasioNoteOff(byte channel, byte pitch, byte velocity) {
   synthesiaVelocity[pitch] = 0;
   autoSatisfied[pitch]     = false;
 
-  extinguishPhysicalKey(musicalToCasioPitch(pitch));
+  int casioKey = litCasioKeyForPitch[pitch];
+  litCasioKeyForPitch[pitch] = -1;
 
+  if (casioKey != -1) {
+    if (!isCasioKeyStillNeeded(casioKey)) {
+      extinguishPhysicalKey(casioKey);
+    }
+  } else if (dublerActive && channel == DUBLER_CHANNEL) {
+    int dk = musicalToCasioPitch(pitch);
+    if (dk == -1 && smartFoldEnabled) dk = musicalToCasioPitch(foldPitchToRange(pitch));
+    if (dk != -1 && !isCasioKeyStillNeeded(dk)) {
+      extinguishPhysicalKey(dk);
+    }
+  }
+
+  // In Silent Assist mode, if a lower active note is still waiting after the
+  // top note ended, light that new highest note (with Smart Folding if needed).
   if (isSilentAssist()) {
     int newHighest = getHighestActiveSynthesiaNote();
-    if (newHighest != -1) {
-      int casioKey = musicalToCasioPitch(newHighest);
-      if (casioKey != -1 && !keyLit[casioKey] && !pendingOn[casioKey]) {
-        lightPhysicalKey(casioKey, synthesiaVelocity[newHighest]);
-      }
+    if (newHighest != -1 && litCasioKeyForPitch[newHighest] == -1) {
+      lightMusicalPitch(channel, (byte)newHighest, synthesiaVelocity[newHighest], true);
     }
   }
 }
 
 void pcToCasioControlChange(byte channel, byte control, byte value) {
   if (control == 120 || control == 123) {
-    // Clear active lights & chord state, but keep latched OOR alert visible
     clearAllLightsAndState();
   }
 }
@@ -855,15 +963,17 @@ void setup() {
   dublerActive          = (lastDublerReading == LOW);
 
   for (int i = 0; i < 128; i++) {
-    keyLit[i]            = false;
-    keyOffTime[i]        = 0;
-    pendingOn[i]         = false;
-    pendingOnTime[i]     = 0;
-    pendingVelocity[i]   = 0;
-    synthesiaActive[i]   = false;
-    synthesiaVelocity[i] = 0;
-    autoSatisfied[i]     = false;
-    autoNoteOnSent[i]    = false;
+    keyLit[i]               = false;
+    keyOffTime[i]           = 0;
+    pendingOn[i]            = false;
+    pendingOnTime[i]        = 0;
+    pendingVelocity[i]      = 0;
+    sentPitchForCasioKey[i] = -1;
+    synthesiaActive[i]      = false;
+    synthesiaVelocity[i]    = 0;
+    autoSatisfied[i]        = false;
+    autoNoteOnSent[i]       = false;
+    litCasioKeyForPitch[i]  = -1;
   }
 
   rebuildDodekaMap();
@@ -886,5 +996,5 @@ void loop() {
   checkControlPins();              // Poll Pins 2, 3, 4, 5, and 6
   processPendingLights();          // Fire any completed 60 ms repeated-note blinks
   serviceOled();                   // Rate-limited OLED splash & MIDI analyzer refresh
-  checkSerialQuery();              // Handle '?', 'O', '+', '-', 'C', and 'L'
+  checkSerialQuery();              // Handle '?', 'F', 'O', '+', '-', 'C', and 'L'
 }
