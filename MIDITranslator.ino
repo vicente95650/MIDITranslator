@@ -1,52 +1,38 @@
 /*
  * ============================================================================
  *  Casio LK-160 <-> Teensy 4.1 MIDI Bridge & Live OLED MIDI Analyzer
- *  (Dodeka + Synthesia + Dubler 2 + Melody Assist + Serial Query + SH1106 OLED)
+ *  (Dodeka + Synthesia + Dubler 2 + Melody Assist + Octave Shift + Range Alert)
  * ============================================================================
  *
- *  FIRMWARE IDENTIFICATION & SERIAL COMMANDS:
- *    - Upload with: Tools -> USB Type -> Serial + MIDI
- *    - Open Arduino Serial Monitor and send:
- *        * '?' or 'v' : Print firmware name, version, build date/time, OLED
- *                       status, active OLED layout, and live switch positions.
- *        * 'L'        : Toggle OLED analyzer live between Layout A (Fixed Slots)
- *                       and Layout B (4-Line Scrolling Log).
+ *  SERIAL COMMANDS (Tools -> USB Type -> Serial + MIDI):
+ *    Open Arduino Serial Monitor and send a single character:
+ *      - '?' or 'v' : Print firmware version, build timestamp, active Dodeka
+ *                     range, switch states, OLED status, and any latched
+ *                     out-of-range note alert.
+ *      - 'O'        : Toggle Dodeka window between C3-B5 (default) and C4-B6.
+ *      - '+' / '-'  : Shift Dodeka window up or down by 1 octave (C2..C5 base).
+ *      - 'C'        : Clear the latched Range-Exceeded indicator (!HI / !LO).
+ *      - 'L'        : Toggle OLED analyzer between Layout A (Fixed Slots)
+ *                     and Layout B (4-Line Scrolling Log).
  *
  *  OPTIONAL 1.3" SH1106 I2C OLED DISPLAY:
  *    - Set ENABLE_OLED to 0 to compile without any display libraries.
  *    - Set ENABLE_OLED to 1 after installing "Adafruit SH110X" (+ "Adafruit GFX").
- *    - Set DEFAULT_OLED_LAYOUT to OLED_LAYOUT_SLOTS (A) or OLED_LAYOUT_LOG (B).
- *    - Wiring (verify silkscreen labels printed on your OLED PCB):
+ *    - Wiring (check silkscreen labels on your OLED PCB):
  *        * VCC -> Teensy 3.3V   (do NOT use 5V)
  *        * GND -> Teensy GND
  *        * SDA -> Teensy Pin 18
  *        * SCK -> Teensy Pin 19
- *    - If ENABLE_OLED is 1 but no OLED is connected, the Teensy auto-detects
- *      its absence at boot and runs normally with zero display overhead.
- *    - Redraws are decoupled from MIDI callbacks and rate-limited (80 ms) so
- *      MIDI forwarding always happens first with zero added latency.
+ *    - Auto-detects screen at boot; runs normally with zero overhead if absent.
  *
  *  HARDWARE SWITCHES (All use INPUT_PULLUP: OPEN = HIGH, GROUNDED = LOW):
- *    - Pin 2 (Keyboard Mode):
- *        * OPEN (HIGH)    = Standard 61-key Piano (1:1 pass-through).
- *        * GROUNDED (LOW) = 36-key Dodeka (white keys C2..C7 -> C3..B5).
- *    - Pin 3 (Dubler Gate):
- *        * OPEN (HIGH)    = Dubler (Ch 1) blocked; sends CC #104 = 0 on Ch 1.
- *        * GROUNDED (LOW) = Dubler (Ch 1) allowed; sends CC #104 = 127 on Ch 1.
- *    - Pin 4 (Hand Filter):
- *        * OPEN (HIGH)    = Both Hands allowed (Synthesia LH + RH channels).
- *        * GROUNDED (LOW) = Right Hand Only (blocks Synthesia LH channels).
- *    - Pin 5 (Melody Assist Master Enable):
- *        * OPEN (HIGH)    = OFF (Normal Practice: you press every lit key).
- *        * GROUNDED (LOW) = ON  (Pressing the highest active note auto-presses
- *                                all lower active notes).
- *    - Pin 6 (Harmony Sound — active ONLY when Pin 5 is GROUNDED):
- *        * OPEN (HIGH)    = SILENT ASSIST (everyday default):
- *                           - Lights ONLY the single highest active key.
- *                           - Auto-presses lower notes at velocity = 1.
- *        * GROUNDED (LOW) = SOUND ASSIST (troubleshooting):
- *                           - Lights ALL allowed active keys as usual.
- *                           - Auto-presses lower notes at your playing velocity.
+ *    - Pin 2 (Keyboard Mode) : OPEN = 61-key Piano | GND = 36-key Dodeka
+ *    - Pin 3 (Dubler Gate)   : OPEN = Ch 1 blocked | GND = Ch 1 allowed (+ CC #104)
+ *    - Pin 4 (Hand Filter)   : OPEN = Both Hands   | GND = Right Hand Only
+ *    - Pin 5 (Melody Assist) : OPEN = OFF          | GND = ON
+ *    - Pin 6 (Harmony Sound) : (Active only when Pin 5 is GND)
+ *                              OPEN = Silent Assist (highest LED only, vel = 1)
+ *                              GND  = Sound Assist  (all LEDs, full velocity)
  * ============================================================================
  */
 
@@ -54,7 +40,7 @@
 // 0. FIRMWARE VERSION, OLED ENABLE, & ANALYZER LAYOUT OPTIONS
 // ----------------------------------------------------------------------------
 #define FW_NAME     "Casio LK-160 Bridge"
-#define FW_VERSION  "v2.2"
+#define FW_VERSION  "v2.3"
 
 // Change to 1 after installing "Adafruit SH110X" and "Adafruit GFX Library"
 #define ENABLE_OLED 0
@@ -98,11 +84,18 @@ const byte DUBLER_CC           = 104; // MIDI CC sent to Mac when Pin 3 toggles
 const byte SILENT_VELOCITY     = 1;   // Lowest valid Note On (inaudible in Synthesia)
 
 // ----------------------------------------------------------------------------
-// 3. DODEKA MAPPING & BLINK TIMING CONFIGURATION
+// 3. KEYBOARD RANGE, DODEKA MAPPING, & BLINK TIMING
 // ----------------------------------------------------------------------------
-const int PHYSICAL_START_NOTE = 36;   // Leftmost physical white key on Casio (C2)
-const int DODEKA_START_NOTE   = 48;   // Musical pitch for that key in Dodeka (C3)
-const int NUM_WHITE_KEYS      = 36;   // 36 white keys (C2..C7) -> 3 octaves (C3..B5)
+const int PHYSICAL_START_NOTE = 36;   // Leftmost key on 61-key Casio LK-160 (C2)
+const int PHYSICAL_END_NOTE   = 96;   // Rightmost key on 61-key Casio LK-160 (C7)
+const int NUM_WHITE_KEYS      = 36;   // 36 white keys (C2..C7) -> 3 chromatic octaves
+
+const int DEFAULT_DODEKA_START = 48;  // C3 (window: C3..B5)
+const int ALT_DODEKA_START     = 60;  // C4 (window: C4..B6)
+const int MIN_DODEKA_START     = 36;  // C2 (lowest allowed shift via '-')
+const int MAX_DODEKA_START     = 72;  // C5 (highest allowed shift via '+')
+
+int currentDodekaStart = DEFAULT_DODEKA_START;
 
 const unsigned long RETRIGGER_GAP_MS = 60; // Dark blink gap (ms) for repeated notes
 const int whiteKeyGaps[] = {2, 2, 1, 2, 2, 2, 1};
@@ -110,8 +103,20 @@ const int whiteKeyGaps[] = {2, 2, 1, 2, 2, 2, 1};
 int dodekaMap[128];                   // physicalCasioPitch -> musicalPitch (-1 = ignore)
 int reverseDodekaMap[128];            // musicalPitch -> physicalCasioPitch (-1 = out of range)
 
+const char* NOTE_NAMES[12] = {
+  "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"
+};
+
 // ----------------------------------------------------------------------------
-// 4. PER-KEY CASIO LED STATE (indexed by physical Casio MIDI note 0..127)
+// 4. LATCHED RANGE-EXCEEDED TRACKER (Cleared via Serial 'C' or Octave Change)
+// ----------------------------------------------------------------------------
+bool oorLow       = false;            // True if a playable note fell below range
+bool oorHigh      = false;            // True if a playable note exceeded range
+int  oorMinPitch  = 128;              // Lowest out-of-range pitch captured
+int  oorMaxPitch  = -1;               // Highest out-of-range pitch captured
+
+// ----------------------------------------------------------------------------
+// 5. PER-KEY CASIO LED STATE (indexed by physical Casio MIDI note 0..127)
 // ----------------------------------------------------------------------------
 bool keyLit[128];
 unsigned long keyOffTime[128];
@@ -120,7 +125,7 @@ unsigned long pendingOnTime[128];
 byte pendingVelocity[128];
 
 // ----------------------------------------------------------------------------
-// 5. MELODY ASSIST TRACKER (indexed by musical MIDI pitch 0..127)
+// 6. MELODY ASSIST TRACKER (indexed by musical MIDI pitch 0..127)
 // ----------------------------------------------------------------------------
 bool synthesiaActive[128];
 byte synthesiaVelocity[128];
@@ -128,7 +133,7 @@ bool autoSatisfied[128];
 bool autoNoteOnSent[128];
 
 // ----------------------------------------------------------------------------
-// 6. SWITCH STATE & DEBOUNCING
+// 7. SWITCH STATE & DEBOUNCING
 // ----------------------------------------------------------------------------
 bool lastModeState         = HIGH;
 bool lastHandFilterState   = HIGH;
@@ -141,7 +146,7 @@ unsigned long lastDebounceTime = 0;
 const unsigned long DEBOUNCE_MS = 30;
 
 // ----------------------------------------------------------------------------
-// 7. OPTIONAL SH1106 OLED & MIDI ANALYZER STATE
+// 8. OPTIONAL SH1106 OLED & MIDI ANALYZER STATE
 // ----------------------------------------------------------------------------
 byte currentOledLayout = DEFAULT_OLED_LAYOUT;
 
@@ -154,10 +159,10 @@ byte currentOledLayout = DEFAULT_OLED_LAYOUT;
   bool oledDirty                = false;
   unsigned long lastOledDrawMs  = 0;
 
-  const unsigned long SPLASH_DURATION_MS  = 2000; // Boot splash duration (ms)
-  const unsigned long OLED_MIN_REFRESH_MS = 80;   // Rate limit (~12 fps max)
+  const unsigned long SPLASH_DURATION_MS  = 2000;
+  const unsigned long OLED_MIN_REFRESH_MS = 80;
 
-  // Layout A: Fixed Slot text buffers (21 chars max + null terminator)
+  // Layout A: Fixed Slot text buffers
   char slotIn[24]  = "IN  ---";
   char slotFlt[24] = "FLT ---";
   char slotOut[24] = "OUT ---";
@@ -165,14 +170,15 @@ byte currentOledLayout = DEFAULT_OLED_LAYOUT;
 
   // Layout B: 4-Line chronological scrolling log
   char logLines[4][24] = { "", "", "", "" };
-
-  const char* NOTE_NAMES[12] = {
-    "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"
-  };
 #endif
 
 // ============================================================================
-// HELPER FUNCTIONS: MODE & CHANNEL CHECKS
+// FORWARD DECLARATIONS
+// ============================================================================
+void clearAllLightsAndState();
+
+// ============================================================================
+// HELPER FUNCTIONS: MODE, RANGE, & NOTE FORMATTING
 // ============================================================================
 
 bool isPianoMode()        { return digitalRead(modeSwitchPin)   == HIGH; }
@@ -194,9 +200,28 @@ const char* getAssistShortLabel() {
   return isHarmonySoundOn() ? "SND" : "SIL";
 }
 
+// Formats a MIDI pitch (0..127) as "C3", "G#4", etc.
+void formatNoteName(byte pitch, char* out, size_t outSize) {
+  int octave = (pitch / 12) - 1;
+  snprintf(out, outSize, "%s%d", NOTE_NAMES[pitch % 12], octave);
+}
+
+int getMinPlayablePitch() {
+  return isPianoMode() ? PHYSICAL_START_NOTE : currentDodekaStart;
+}
+
+int getMaxPlayablePitch() {
+  return isPianoMode() ? PHYSICAL_END_NOTE : (currentDodekaStart + NUM_WHITE_KEYS - 1);
+}
+
+// Maps musical pitch to physical Casio key (-1 if outside physical range)
 int musicalToCasioPitch(int musicalPitch) {
   if (musicalPitch < 0 || musicalPitch >= 128) return -1;
-  return isPianoMode() ? musicalPitch : reverseDodekaMap[musicalPitch];
+  if (isPianoMode()) {
+    if (musicalPitch < PHYSICAL_START_NOTE || musicalPitch > PHYSICAL_END_NOTE) return -1;
+    return musicalPitch;
+  }
+  return reverseDodekaMap[musicalPitch];
 }
 
 int getHighestActiveSynthesiaNote() {
@@ -206,18 +231,55 @@ int getHighestActiveSynthesiaNote() {
   return -1;
 }
 
+// Rebuilds the bidirectional 36-key Dodeka lookup tables for currentDodekaStart
+void rebuildDodekaMap() {
+  for (int i = 0; i < 128; i++) {
+    dodekaMap[i]        = -1;
+    reverseDodekaMap[i] = -1;
+  }
+
+  int currentCasioNote = PHYSICAL_START_NOTE;
+  int dodekaNote       = currentDodekaStart;
+  for (int i = 0; i < NUM_WHITE_KEYS; i++) {
+    if (currentCasioNote < 128 && dodekaNote < 128) {
+      dodekaMap[currentCasioNote]  = dodekaNote;
+      reverseDodekaMap[dodekaNote] = currentCasioNote;
+    }
+    dodekaNote++;
+    currentCasioNote += whiteKeyGaps[i % 7];
+  }
+}
+
+void clearRangeAlert() {
+  oorLow      = false;
+  oorHigh     = false;
+  oorMinPitch = 128;
+  oorMaxPitch = -1;
+#if ENABLE_OLED
+  splashActive = false;
+  oledDirty    = true;
+#endif
+}
+
+// Latches low/high range-exceeded flags when a playable note falls outside range
+void latchOutOfRange(byte pitch) {
+  if (pitch < getMinPlayablePitch()) {
+    oorLow = true;
+    if (pitch < oorMinPitch) oorMinPitch = pitch;
+  } else if (pitch > getMaxPlayablePitch()) {
+    oorHigh = true;
+    if (pitch > oorMaxPitch) oorMaxPitch = pitch;
+  }
+#if ENABLE_OLED
+  oledDirty = true;
+#endif
+}
+
 // ============================================================================
 // HELPER FUNCTIONS: MIDI ANALYZER RECORDING & OLED RENDERING
 // ============================================================================
 
 #if ENABLE_OLED
-// Formats a MIDI pitch (0..127) as "C4", "G#4", etc.
-void formatNoteName(byte pitch, char* out, size_t outSize) {
-  int octave = (pitch / 12) - 1;
-  snprintf(out, outSize, "%s%d", NOTE_NAMES[pitch % 12], octave);
-}
-
-// Pushes a formatted line onto the 4-line scrolling log (Layout B)
 void pushLogLine(const char* line) {
   for (int i = 0; i < 3; i++) {
     strncpy(logLines[i], logLines[i + 1], sizeof(logLines[i]) - 1);
@@ -228,10 +290,6 @@ void pushLogLine(const char* line) {
 }
 #endif
 
-// Records a MIDI event into both Layout A (slot) and Layout B (log).
-// Called AFTER MIDI forwarding; takes nanoseconds and never blocks I2C.
-//   dirTag: "IN", "FLT", "OUT", or "AUT"
-//   detail: e.g. "v100", "BLK", "OOR", "HID"
 void recordMidiEvent(const char* dirTag, byte channel, byte pitch, const char* detail) {
 #if ENABLE_OLED
   if (!oledPresent) return;
@@ -239,11 +297,9 @@ void recordMidiEvent(const char* dirTag, byte channel, byte pitch, const char* d
   char noteStr[8];
   formatNoteName(pitch, noteStr, sizeof(noteStr));
 
-  // Build compact 21-char line, e.g.: "IN C13 G4(67) v100" or "FLT C05 G3(55) BLK"
   char line[24];
   snprintf(line, sizeof(line), "%-3s C%02d %s(%d) %s", dirTag, channel, noteStr, pitch, detail);
 
-  // Update the corresponding Fixed Slot (Layout A)
   if (strcmp(dirTag, "IN") == 0) {
     strncpy(slotIn, line, sizeof(slotIn) - 1);
     slotIn[sizeof(slotIn) - 1] = '\0';
@@ -258,9 +314,7 @@ void recordMidiEvent(const char* dirTag, byte channel, byte pitch, const char* d
     slotAut[sizeof(slotAut) - 1] = '\0';
   }
 
-  // Append to the Scrolling Log (Layout B)
   pushLogLine(line);
-
   oledDirty = true;
 #else
   (void)dirTag; (void)channel; (void)pitch; (void)detail;
@@ -276,34 +330,52 @@ void drawOledScreen() {
   display.setTextSize(1);
   display.setTextWrap(false);
 
-  // --- Top Compact Status Bar (max 21 chars) ---
-  // Example: "v2.2 DDK BH SIL D0 A"
-  char header[24];
-  snprintf(header, sizeof(header), "%s %s %s %s D%d %c",
-           FW_VERSION,
+  // --- Top Compact Status Bar ---
+  // Left/Center: Mode + Base Note + Hands + Assist + Dubler (e.g. "DDK C3 BH SIL D0")
+  char startStr[6];
+  if (isPianoMode()) {
+    snprintf(startStr, sizeof(startStr), "61");
+  } else {
+    formatNoteName((byte)currentDodekaStart, startStr, sizeof(startStr));
+  }
+
+  char header[20];
+  snprintf(header, sizeof(header), "%s %s %s %s D%d",
            isPianoMode() ? "PIA" : "DDK",
+           startStr,
            isBothHandsAllowed() ? "BH" : "RH",
            getAssistShortLabel(),
-           dublerActive ? 1 : 0,
-           (currentOledLayout == OLED_LAYOUT_SLOTS) ? 'A' : 'B');
+           dublerActive ? 1 : 0);
 
-  display.setCursor(0, 0);
+  display.setCursor(0, 1);
   display.print(header);
-  display.drawFastHLine(0, 10, 128, SH110X_WHITE);
 
-  // --- Analyzer Body (4 lines at y = 14, 27, 40, 53) ---
-  if (currentOledLayout == OLED_LAYOUT_SLOTS) {
-    // Layout A: Fixed Slots
-    display.setCursor(0, 14); display.print(slotIn);
-    display.setCursor(0, 27); display.print(slotFlt);
-    display.setCursor(0, 40); display.print(slotOut);
-    display.setCursor(0, 53); display.print(slotAut);
+  // Top-Right Corner: Inverted Range Alert (!HI / !LO / !HL) OR Layout (L:A / L:B)
+  if (oorLow || oorHigh) {
+    const char* badge = (oorLow && oorHigh) ? "!HL" : (oorHigh ? "!HI" : "!LO");
+    display.fillRect(104, 0, 24, 9, SH110X_WHITE);
+    display.setTextColor(SH110X_BLACK);
+    display.setCursor(107, 1);
+    display.print(badge);
+    display.setTextColor(SH110X_WHITE);
   } else {
-    // Layout B: 4-Line Scrolling Event Log
-    display.setCursor(0, 14); display.print(logLines[0]);
-    display.setCursor(0, 27); display.print(logLines[1]);
-    display.setCursor(0, 40); display.print(logLines[2]);
-    display.setCursor(0, 53); display.print(logLines[3]);
+    display.setCursor(109, 1);
+    display.print((currentOledLayout == OLED_LAYOUT_SLOTS) ? "L:A" : "L:B");
+  }
+
+  display.drawFastHLine(0, 11, 128, SH110X_WHITE);
+
+  // --- Analyzer Body (4 lines) ---
+  if (currentOledLayout == OLED_LAYOUT_SLOTS) {
+    display.setCursor(0, 15); display.print(slotIn);
+    display.setCursor(0, 28); display.print(slotFlt);
+    display.setCursor(0, 41); display.print(slotOut);
+    display.setCursor(0, 54); display.print(slotAut);
+  } else {
+    display.setCursor(0, 15); display.print(logLines[0]);
+    display.setCursor(0, 28); display.print(logLines[1]);
+    display.setCursor(0, 41); display.print(logLines[2]);
+    display.setCursor(0, 54); display.print(logLines[3]);
   }
 
   display.display();
@@ -315,9 +387,8 @@ void drawOledScreen() {
 void initOled() {
 #if ENABLE_OLED
   Wire.begin();
-  Wire.setClock(400000); // 400 kHz fast I2C
+  Wire.setClock(400000);
 
-  // Auto-detect SH1106 at standard I2C addresses (0x3C or 0x3D)
   const byte candidateAddrs[2] = {0x3C, 0x3D};
   for (int i = 0; i < 2; i++) {
     Wire.beginTransmission(candidateAddrs[i]);
@@ -335,7 +406,6 @@ void initOled() {
     return;
   }
 
-  // Non-blocking 2-second boot splash (MIDI works immediately while shown)
   display.clearDisplay();
   display.setTextColor(SH110X_WHITE);
   display.setTextSize(2);
@@ -356,7 +426,6 @@ void initOled() {
 #endif
 }
 
-// Handles boot splash transition and rate-limited live MIDI analyzer refreshes
 void serviceOled() {
 #if ENABLE_OLED
   if (!oledPresent) return;
@@ -378,8 +447,22 @@ void serviceOled() {
 }
 
 // ============================================================================
-// HELPER FUNCTIONS: SERIAL '?' STATUS & 'L' LAYOUT TOGGLE
+// HELPER FUNCTIONS: SERIAL COMMANDS ('?', 'O', '+', '-', 'C', 'L')
 // ============================================================================
+
+void printActiveRange() {
+  char lowStr[8], highStr[8];
+  formatNoteName((byte)getMinPlayablePitch(), lowStr, sizeof(lowStr));
+  formatNoteName((byte)getMaxPlayablePitch(), highStr, sizeof(highStr));
+  Serial.print(lowStr);
+  Serial.print("-");
+  Serial.print(highStr);
+  Serial.print(" (MIDI ");
+  Serial.print(getMinPlayablePitch());
+  Serial.print("-");
+  Serial.print(getMaxPlayablePitch());
+  Serial.print(")");
+}
 
 void printFirmwareInfo() {
   Serial.println();
@@ -417,8 +500,51 @@ void printFirmwareInfo() {
   Serial.print(getAssistModeLabel());
   Serial.print(" | Dubler: ");
   Serial.println(dublerActive ? "ON" : "OFF");
-  Serial.println("Commands : '?' = Status | 'L' = Toggle OLED Layout");
+
+  Serial.print("Range    : ");
+  printActiveRange();
+  Serial.println();
+
+  Serial.print("OOR Alert: ");
+  if (!oorLow && !oorHigh) {
+    Serial.println("OK (no notes exceeded range)");
+  } else {
+    char noteStr[8];
+    if (oorLow) {
+      formatNoteName((byte)oorMinPitch, noteStr, sizeof(noteStr));
+      Serial.print("LOW (min ");
+      Serial.print(noteStr);
+      Serial.print("/");
+      Serial.print(oorMinPitch);
+      Serial.print(") ");
+    }
+    if (oorHigh) {
+      formatNoteName((byte)oorMaxPitch, noteStr, sizeof(noteStr));
+      Serial.print("HIGH (max ");
+      Serial.print(noteStr);
+      Serial.print("/");
+      Serial.print(oorMaxPitch);
+      Serial.print(") ");
+    }
+    Serial.println("-- send 'C' to clear");
+  }
+
+  Serial.println("Commands : '?'=Status | 'O'=C3/C4 | '+'/'-'=Octave | 'C'=Clear OOR | 'L'=Layout");
   Serial.println("========================================");
+}
+
+void applyDodekaStart(int newStart) {
+  if (newStart < MIN_DODEKA_START) newStart = MIN_DODEKA_START;
+  if (newStart > MAX_DODEKA_START) newStart = MAX_DODEKA_START;
+
+  currentDodekaStart = newStart;
+  clearAllLightsAndState();
+  rebuildDodekaMap();
+  clearRangeAlert();
+
+  Serial.print("Dodeka range set to: ");
+  printActiveRange();
+  Serial.println();
 }
 
 void checkSerialQuery() {
@@ -426,6 +552,18 @@ void checkSerialQuery() {
     char c = Serial.read();
     if (c == '?' || c == 'v' || c == 'V') {
       printFirmwareInfo();
+    } else if (c == 'o' || c == 'O') {
+      int nextStart = (currentDodekaStart == DEFAULT_DODEKA_START)
+                        ? ALT_DODEKA_START
+                        : DEFAULT_DODEKA_START;
+      applyDodekaStart(nextStart);
+    } else if (c == '+' || c == '=') {
+      applyDodekaStart(currentDodekaStart + 12);
+    } else if (c == '-' || c == '_') {
+      applyDodekaStart(currentDodekaStart - 12);
+    } else if (c == 'c' || c == 'C') {
+      clearRangeAlert();
+      Serial.println("Range-exceeded alert cleared.");
     } else if (c == 'l' || c == 'L') {
       currentOledLayout = (currentOledLayout == OLED_LAYOUT_SLOTS)
                             ? OLED_LAYOUT_LOG
@@ -507,6 +645,9 @@ void checkControlPins() {
 
   if (modeNow != lastModeState || handNow != lastHandFilterState ||
       assistNow != lastMelodyAssistState || soundNow != lastHarmonySoundState) {
+    if (modeNow != lastModeState) {
+      clearRangeAlert(); // Switching Piano <-> Dodeka changes playable range
+    }
     lastModeState         = modeNow;
     lastHandFilterState   = handNow;
     lastMelodyAssistState = assistNow;
@@ -515,7 +656,6 @@ void checkControlPins() {
     stateChanged = true;
   }
 
-  // Pin 3 (Dubler Gate) with 30 ms debounce
   bool reading = digitalRead(dublerPin);
   if (reading != lastDublerReading) {
     lastDebounceTime = millis();
@@ -561,17 +701,14 @@ void casioToPcNoteOn(byte channel, byte pitch, byte velocity) {
   }
 
   int musicalPitch = isPianoMode() ? pitch : dodekaMap[pitch];
-  if (musicalPitch == -1) return; // Ignore black keys in Dodeka mode
+  if (musicalPitch == -1) return;
 
-  // 1. Forward user's note FIRST (zero added latency)
   usbMIDI.sendNoteOn(musicalPitch, velocity, channel);
 
-  // Log outgoing note to OLED analyzer
   char velBuf[8];
   snprintf(velBuf, sizeof(velBuf), "v%d", velocity);
   recordMidiEvent("OUT", channel, (byte)musicalPitch, velBuf);
 
-  // 2. MELODY ASSIST: Auto-press lower active notes when user plays highest note
   if (isMelodyAssistOn()) {
     int highest = getHighestActiveSynthesiaNote();
     if (highest != -1 && musicalPitch == highest) {
@@ -618,6 +755,7 @@ void pcToCasioNoteOn(byte channel, byte pitch, byte velocity) {
       lightPhysicalKey(casioKey, velocity);
       recordMidiEvent("IN", channel, pitch, velBuf);
     } else {
+      latchOutOfRange(pitch);
       recordMidiEvent("FLT", channel, pitch, "OOR");
     }
     return;
@@ -647,10 +785,11 @@ void pcToCasioNoteOn(byte channel, byte pitch, byte velocity) {
         lightPhysicalKey(casioKey, velocity);
         recordMidiEvent("IN", channel, pitch, velBuf);
       } else {
+        latchOutOfRange(pitch);
         recordMidiEvent("FLT", channel, pitch, "OOR");
       }
     } else {
-      // Lower note kept dark in Silent Assist (will be auto-pressed silently)
+      // Lower note kept dark in Silent Assist (auto-pressed silently; never triggers OOR)
       recordMidiEvent("IN", channel, pitch, "HID");
     }
   } else {
@@ -659,6 +798,7 @@ void pcToCasioNoteOn(byte channel, byte pitch, byte velocity) {
       lightPhysicalKey(casioKey, velocity);
       recordMidiEvent("IN", channel, pitch, velBuf);
     } else {
+      latchOutOfRange(pitch);
       recordMidiEvent("FLT", channel, pitch, "OOR");
     }
   }
@@ -689,6 +829,7 @@ void pcToCasioNoteOff(byte channel, byte pitch, byte velocity) {
 
 void pcToCasioControlChange(byte channel, byte control, byte value) {
   if (control == 120 || control == 123) {
+    // Clear active lights & chord state, but keep latched OOR alert visible
     clearAllLightsAndState();
   }
 }
@@ -698,7 +839,6 @@ void pcToCasioControlChange(byte channel, byte control, byte value) {
 // ============================================================================
 
 void setup() {
-  // Start USB Serial (never wait for Serial Monitor so standalone boot is instant)
   Serial.begin(115200);
 
   pinMode(modeSwitchPin,   INPUT_PULLUP);
@@ -715,8 +855,6 @@ void setup() {
   dublerActive          = (lastDublerReading == LOW);
 
   for (int i = 0; i < 128; i++) {
-    dodekaMap[i]         = -1;
-    reverseDodekaMap[i]  = -1;
     keyLit[i]            = false;
     keyOffTime[i]        = 0;
     pendingOn[i]         = false;
@@ -728,19 +866,7 @@ void setup() {
     autoNoteOnSent[i]    = false;
   }
 
-  // Build bidirectional 36-key Dodeka map (physical C2..C7 <-> musical C3..B5)
-  int currentCasioNote = PHYSICAL_START_NOTE;
-  int dodekaNote       = DODEKA_START_NOTE;
-  for (int i = 0; i < NUM_WHITE_KEYS; i++) {
-    if (currentCasioNote < 128 && dodekaNote < 128) {
-      dodekaMap[currentCasioNote]  = dodekaNote;
-      reverseDodekaMap[dodekaNote] = currentCasioNote;
-    }
-    dodekaNote++;
-    currentCasioNote += whiteKeyGaps[i % 7];
-  }
-
-  // Probe for optional 1.3" SH1106 OLED (safely no-ops if disabled or absent)
+  rebuildDodekaMap();
   initOled();
 
   myusb.begin();
@@ -760,5 +886,5 @@ void loop() {
   checkControlPins();              // Poll Pins 2, 3, 4, 5, and 6
   processPendingLights();          // Fire any completed 60 ms repeated-note blinks
   serviceOled();                   // Rate-limited OLED splash & MIDI analyzer refresh
-  checkSerialQuery();              // Handle '?' (status) and 'L' (layout toggle)
+  checkSerialQuery();              // Handle '?', 'O', '+', '-', 'C', and 'L'
 }
